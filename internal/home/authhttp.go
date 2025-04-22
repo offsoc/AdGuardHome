@@ -1,6 +1,7 @@
 package home
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -32,10 +33,14 @@ type loginJSON struct {
 }
 
 // newCookie creates a new authentication cookie.
-func (a *Auth) newCookie(req loginJSON, addr string) (c *http.Cookie, err error) {
+func (a *Auth) newCookie(
+	ctx context.Context,
+	req loginJSON,
+	addr string,
+) (c *http.Cookie, err error) {
 	rateLimiter := a.rateLimiter
-	u, ok := a.findUser(req.Name, req.Password)
-	if !ok {
+	u := a.findUser(ctx, req.Name, req.Password)
+	if u == nil {
 		if rateLimiter != nil {
 			rateLimiter.inc(addr)
 		}
@@ -47,19 +52,16 @@ func (a *Auth) newCookie(req loginJSON, addr string) (c *http.Cookie, err error)
 		rateLimiter.remove(addr)
 	}
 
-	sess := newSessionToken()
-	now := time.Now().UTC()
-
-	a.addSession(sess, &session{
-		userName: u.Name,
-		expire:   uint32(now.Unix()) + a.sessionTTL,
-	})
+	s, err := a.sessions.New(ctx, u)
+	if err != nil {
+		return nil, fmt.Errorf("creating session: %w", err)
+	}
 
 	return &http.Cookie{
 		Name:     sessionCookieName,
-		Value:    hex.EncodeToString(sess),
+		Value:    hex.EncodeToString(s.Token[:]),
 		Path:     "/",
-		Expires:  now.Add(cookieTTL),
+		Expires:  time.Now().Add(cookieTTL),
 		HttpOnly: true,
 		SameSite: http.SameSiteLaxMode,
 	}, nil
@@ -172,7 +174,7 @@ func handleLogin(w http.ResponseWriter, r *http.Request) {
 		log.Error("auth: getting real ip from request with remote ip %s: %s", remoteIP, err)
 	}
 
-	cookie, err := globalContext.auth.newCookie(req, remoteIP)
+	cookie, err := globalContext.auth.newCookie(r.Context(), req, remoteIP)
 	if err != nil {
 		logIP := remoteIP
 		if globalContext.auth.trustedProxies.Contains(ip.Unmap()) {
@@ -209,7 +211,7 @@ func handleLogout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	globalContext.auth.removeSession(c.Value)
+	globalContext.auth.removeSession(r.Context(), c.Value)
 
 	c = &http.Cookie{
 		Name:    sessionCookieName,
@@ -242,28 +244,7 @@ func optionalAuthThird(w http.ResponseWriter, r *http.Request) (mustAuth bool) {
 		return false
 	}
 
-	// redirect to login page if not authenticated
-	isAuthenticated := false
-	cookie, err := r.Cookie(sessionCookieName)
-	if err != nil {
-		// The only error that is returned from r.Cookie is [http.ErrNoCookie].
-		// Check Basic authentication.
-		user, pass, hasBasic := r.BasicAuth()
-		if hasBasic {
-			_, isAuthenticated = globalContext.auth.findUser(user, pass)
-			if !isAuthenticated {
-				log.Info("%s: invalid basic authorization value", pref)
-			}
-		}
-	} else {
-		res := globalContext.auth.checkSession(cookie.Value)
-		isAuthenticated = res == checkSessionOK
-		if !isAuthenticated {
-			log.Debug("%s: invalid cookie value: %q", pref, cookie)
-		}
-	}
-
-	if isAuthenticated {
+	if u := globalContext.auth.getCurrentUser(r); u != nil {
 		return false
 	}
 
@@ -289,14 +270,14 @@ func optionalAuth(
 	h func(http.ResponseWriter, *http.Request),
 ) (wrapped func(http.ResponseWriter, *http.Request)) {
 	return func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
 		p := r.URL.Path
-		authRequired := globalContext.auth != nil && globalContext.auth.authRequired()
+		authRequired := globalContext.auth != nil && globalContext.auth.authRequired(ctx)
 		if p == "/login.html" {
 			cookie, err := r.Cookie(sessionCookieName)
 			if authRequired && err == nil {
 				// Redirect to the dashboard if already authenticated.
-				res := globalContext.auth.checkSession(cookie.Value)
-				if res == checkSessionOK {
+				if globalContext.auth.isValidSession(ctx, cookie.Value) {
 					http.Redirect(w, r, "", http.StatusFound)
 
 					return

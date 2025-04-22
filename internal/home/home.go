@@ -668,7 +668,7 @@ func run(opts options, clientBuildFS fs.FS, done chan struct{}, sigHdlr *signalH
 	GLMode = opts.glinetMode
 
 	// Init auth module.
-	globalContext.auth, err = initUsers()
+	globalContext.auth, err = initUsers(ctx, slogLogger)
 	fatalOnError(err)
 
 	web, err := initWeb(ctx, opts, clientBuildFS, upd, slogLogger, tlsMgr, customURL)
@@ -786,7 +786,8 @@ func checkPermissions(
 }
 
 // initUsers initializes context auth module.  Clears config users field.
-func initUsers() (auth *Auth, err error) {
+// baseLogger must not be nil.
+func initUsers(ctx context.Context, baseLogger *slog.Logger) (auth *Auth, err error) {
 	sessFilename := filepath.Join(globalContext.getDataDir(), "sessions.db")
 
 	var rateLimiter *authRateLimiter
@@ -799,10 +800,17 @@ func initUsers() (auth *Auth, err error) {
 
 	trustedProxies := netutil.SliceSubnetSet(netutil.UnembedPrefixes(config.DNS.TrustedProxies))
 
-	sessionTTL := time.Duration(config.HTTPConfig.SessionTTL).Seconds()
-	auth = InitAuth(sessFilename, config.Users, uint32(sessionTTL), rateLimiter, trustedProxies)
-	if auth == nil {
-		return nil, errors.Error("initializing auth module failed")
+	auth, err = InitAuth(
+		ctx,
+		baseLogger,
+		sessFilename,
+		config.Users,
+		time.Duration(config.HTTPConfig.SessionTTL),
+		rateLimiter,
+		trustedProxies,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("initializing auth module: %w", err)
 	}
 
 	config.Users = nil
@@ -916,7 +924,7 @@ func cleanup(ctx context.Context) {
 		globalContext.web = nil
 	}
 	if globalContext.auth != nil {
-		globalContext.auth.Close()
+		globalContext.auth.Close(ctx)
 		globalContext.auth = nil
 	}
 

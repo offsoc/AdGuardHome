@@ -355,8 +355,12 @@ func (ds *DefaultSessionStorage) store(s *Session) (err error) {
 	return nil
 }
 
-// FindByToken implements the [SessionStorage] interface for *DefaultSessionStorage.
-func (ds *DefaultSessionStorage) FindByToken(ctx context.Context, t SessionToken) (s *Session, err error) {
+// FindByToken implements the [SessionStorage] interface for
+// *DefaultSessionStorage.
+func (ds *DefaultSessionStorage) FindByToken(
+	ctx context.Context,
+	t SessionToken,
+) (s *Session, err error) {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 

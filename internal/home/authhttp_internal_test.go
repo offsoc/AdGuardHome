@@ -7,8 +7,10 @@ import (
 	"net/url"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/AdguardTeam/golibs/httphdr"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/AdguardTeam/golibs/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -33,13 +35,20 @@ func (w *testResponseWriter) WriteHeader(statusCode int) {
 }
 
 func TestAuthHTTP(t *testing.T) {
+	var (
+		ctx    = testutil.ContextWithTimeout(t, testTimeout)
+		logger = slogutil.NewDiscardLogger()
+		err    error
+	)
+
 	dir := t.TempDir()
 	fn := filepath.Join(dir, "sessions.db")
 
 	users := []webUser{
 		{Name: "name", PasswordHash: "$2y$05$..vyzAECIhJPfaQiOK17IukcQnqEgKJHy0iETyYqxn3YXJl8yZuo2"},
 	}
-	globalContext.auth = InitAuth(fn, users, 60, nil, nil)
+	globalContext.auth, err = InitAuth(ctx, logger, fn, users, time.Minute, nil, nil)
+	require.NoError(t, err)
 
 	handlerCalled := false
 	handler := func(_ http.ResponseWriter, _ *http.Request) {
@@ -68,7 +77,11 @@ func TestAuthHTTP(t *testing.T) {
 	assert.True(t, handlerCalled)
 
 	// perform login
-	cookie, err := globalContext.auth.newCookie(loginJSON{Name: "name", Password: "password"}, "")
+	cookie, err := globalContext.auth.newCookie(
+		ctx,
+		loginJSON{Name: "name", Password: "password"},
+		"",
+	)
 	require.NoError(t, err)
 	require.NotNil(t, cookie)
 
@@ -114,7 +127,7 @@ func TestAuthHTTP(t *testing.T) {
 	assert.True(t, handlerCalled)
 	r.Header.Del(httphdr.Cookie)
 
-	globalContext.auth.Close()
+	globalContext.auth.Close(ctx)
 }
 
 func TestRealIP(t *testing.T) {
