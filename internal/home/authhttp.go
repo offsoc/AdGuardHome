@@ -1,6 +1,7 @@
 package home
 
 import (
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/AdguardTeam/AdGuardHome/internal/aghhttp"
+	"github.com/AdguardTeam/AdGuardHome/internal/aghuser"
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/httphdr"
 	"github.com/AdguardTeam/golibs/log"
@@ -347,4 +349,151 @@ func (a *authHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // optionalAuthHandler returns a authentication handler.
 func optionalAuthHandler(handler http.Handler) http.Handler {
 	return &authHandler{handler}
+}
+
+// aghUserContextKey is the key used for identifying the web user in the
+// context.
+const aghUserContextKey = "agh_user"
+
+var (
+	// errInvalidLogin is returned when there is an invalid login attempt.
+	errInvalidLogin errors.Error = "invalid username or password"
+
+	// errNoCredentials is returned when there are no authentication cookies or
+	// basic auth credentials.
+	errNoCredentials errors.Error = "no credentials"
+)
+
+// authMiddlewareDefaultConfig is the configuration structure for the default
+// authentication middleware.
+type authMiddlewareDefaultConfig struct {
+	// Sessions contains web user sessions.  It must not be nil.
+	Sessions aghuser.SessionStorage
+
+	// Users contains web user information.  It must not be nil.
+	Users aghuser.DB
+}
+
+// authMiddlewareDefault is the default authentication middleware.  It searches
+// for a web client using an authentication cookie or basic auth credentials and
+// passes it with the context.
+type authMiddlewareDefault struct {
+	sessions aghuser.SessionStorage
+	users    aghuser.DB
+}
+
+// newAuthMiddlewareDefault returns the new properly initialized
+// *authMiddlewareDefault.
+func newAuthMiddlewareDefault(c *authMiddlewareDefaultConfig) (mw *authMiddlewareDefault) {
+	return &authMiddlewareDefault{
+		sessions: c.Sessions,
+		users:    c.Users,
+	}
+}
+
+// wrap adds authentication logic to the provided HTTP handler.
+func (mw *authMiddlewareDefault) wrap(h http.Handler) (wrapped http.Handler) {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+		if !mw.needsAuthentication(ctx, r) {
+			h.ServeHTTP(w, r)
+
+			return
+		}
+
+		u, err := mw.userFromRequest(ctx, r)
+		if u != nil {
+			ctx = context.WithValue(ctx, aghUserContextKey, u)
+			h.ServeHTTP(w, r.WithContext(ctx))
+
+			return
+		}
+
+		if err != nil {
+			// TODO(s.chzhen): !! Log the error.
+		}
+
+		mw.respondWithUnauthorized(ctx, w, r)
+	})
+}
+
+// needsAuthentication returns true if the current request requires
+// authentication.
+func (mw *authMiddlewareDefault) needsAuthentication(
+	ctx context.Context,
+	r *http.Request,
+) (ok bool) {
+	users, _ := mw.users.All(ctx)
+	if len(users) == 0 {
+		return false
+	}
+
+	return true
+}
+
+// userFromRequest tries to retrieve a user based on the request.
+func (mw *authMiddlewareDefault) userFromRequest(
+	ctx context.Context,
+	r *http.Request,
+) (u *aghuser.User, err error) {
+	defer func() { err = errors.Annotate(err, "getting user from request: %w") }()
+
+	cookie, err := r.Cookie(sessionCookieName)
+	if err != nil {
+		return mw.userFromRequestBasicAuth(ctx, r)
+	}
+
+	sess, err := hex.DecodeString(cookie.Value)
+	if err != nil {
+		return nil, fmt.Errorf("decoding cookie: %w", err)
+	}
+
+	var t aghuser.SessionToken
+	copy(t[:], sess)
+
+	s, err := mw.sessions.FindByToken(ctx, t)
+	if err != nil {
+		return nil, fmt.Errorf("searching by token: %w", err)
+	}
+
+	if s == nil {
+		return nil, nil
+	}
+
+	return &aghuser.User{
+		Login: s.UserLogin,
+		ID:    s.UserID,
+	}, nil
+}
+
+// userFromRequestBasicAuth searches for a user using Basic Auth credentials.
+func (mw *authMiddlewareDefault) userFromRequestBasicAuth(
+	ctx context.Context,
+	r *http.Request,
+) (user *aghuser.User, err error) {
+	login, pass, ok := r.BasicAuth()
+	if !ok {
+		return nil, errNoCredentials
+	}
+
+	user, _ = mw.users.ByLogin(ctx, aghuser.Login(login))
+	if user == nil {
+		return nil, errInvalidLogin
+	}
+
+	ok = user.Password.Authenticate(ctx, pass)
+	if !ok {
+		return nil, errInvalidLogin
+	}
+
+	return user, nil
+}
+
+// respondWithUnauthorized responds to the request with an unauthorized status.
+func (mw *authMiddlewareDefault) respondWithUnauthorized(
+	ctx context.Context,
+	w http.ResponseWriter,
+	r *http.Request,
+) {
+	w.WriteHeader(http.StatusUnauthorized)
 }
